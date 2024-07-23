@@ -6,15 +6,10 @@
 
 use std::{
     fmt::Debug,
-    io::Cursor,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     string::FromUtf8Error,
 };
-use tokio::{
-    io,
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::UdpSocket,
-};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 // Error and Result
 // *****************************************************************************
@@ -26,7 +21,7 @@ pub enum Error {
     Io(
         #[from]
         #[source]
-        io::Error,
+        tokio::io::Error,
     ),
     #[error("{0}")]
     FromUtf8(
@@ -77,6 +72,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 // Utilities
 // *****************************************************************************
 
+#[allow(dead_code)]
 trait ReadExt: AsyncReadExt + Unpin {
     async fn read_version(&mut self) -> Result<()> {
         let value = self.read_u8().await?;
@@ -240,6 +236,7 @@ trait ReadExt: AsyncReadExt + Unpin {
 
 impl<T: AsyncReadExt + Unpin> ReadExt for T {}
 
+#[allow(dead_code)]
 trait WriteExt: AsyncWriteExt + Unpin {
     async fn write_version(&mut self) -> Result<()> {
         self.write_u8(0x05).await?;
@@ -465,6 +462,7 @@ pub enum AddrKind {
     Domain(String, u16),
 }
 
+#[cfg(feature = "tokio-net")]
 impl AddrKind {
     const MAX_SIZE: usize = 1 // atyp
         + 1 // domain len
@@ -622,122 +620,136 @@ where
     }
 }
 
-/// A UDP socket that sends packets through a proxy.
-#[derive(Debug)]
-pub struct SocksDatagram<S> {
-    socket: UdpSocket,
-    proxy_addr: AddrKind,
-    stream: S,
-}
+#[cfg(feature = "tokio-net")]
+mod datagram {
+    use super::*;
+    use std::io::Cursor;
+    use tokio::net::UdpSocket;
 
-impl<S> SocksDatagram<S>
-where
-    S: AsyncWriteExt + AsyncReadExt + Send + Unpin,
-{
-    /// Creates `SocksDatagram`. Performs [`UDP ASSOCIATE`] under the hood.
-    ///
-    /// [`UDP ASSOCIATE`]: https://tools.ietf.org/html/rfc1928#page-7
-    pub async fn associate<A>(
-        mut proxy_stream: S,
+    /// A UDP socket that sends packets through a proxy.
+    #[derive(Debug)]
+    pub struct SocksDatagram<S> {
         socket: UdpSocket,
-        auth: Option<Auth>,
-        association_addr: Option<A>,
-    ) -> Result<Self>
+        proxy_addr: AddrKind,
+        stream: S,
+    }
+
+    impl<S> SocksDatagram<S>
     where
-        A: Into<AddrKind>,
+        S: AsyncWriteExt + AsyncReadExt + Send + Unpin,
     {
-        let addr = association_addr
-            .map(Into::into)
-            .unwrap_or_else(|| AddrKind::Ip(SocketAddr::new(IpAddr::from([0, 0, 0, 0]), 0)));
-        let proxy_addr = init(&mut proxy_stream, Command::UdpAssociate, addr, auth).await?;
-        socket.connect(proxy_addr.to_socket_addr()).await?;
-        Ok(Self {
-            socket,
-            proxy_addr,
-            stream: proxy_stream,
-        })
-    }
+        /// Creates `SocksDatagram`. Performs [`UDP ASSOCIATE`] under the hood.
+        ///
+        /// [`UDP ASSOCIATE`]: https://tools.ietf.org/html/rfc1928#page-7
+        pub async fn associate<A>(
+            mut proxy_stream: S,
+            socket: UdpSocket,
+            auth: Option<Auth>,
+            association_addr: Option<A>,
+        ) -> Result<Self>
+        where
+            A: Into<AddrKind>,
+        {
+            let addr = association_addr
+                .map(Into::into)
+                .unwrap_or_else(|| AddrKind::Ip(SocketAddr::new(IpAddr::from([0, 0, 0, 0]), 0)));
+            let proxy_addr = init(&mut proxy_stream, Command::UdpAssociate, addr, auth).await?;
+            socket.connect(proxy_addr.to_socket_addr()).await?;
+            Ok(Self {
+                socket,
+                proxy_addr,
+                stream: proxy_stream,
+            })
+        }
 
-    pub fn proxy_addr(&self) -> &AddrKind {
-        &self.proxy_addr
-    }
+        pub fn proxy_addr(&self) -> &AddrKind {
+            &self.proxy_addr
+        }
 
-    pub fn get_ref(&self) -> &UdpSocket {
-        &self.socket
-    }
+        pub fn get_ref(&self) -> &UdpSocket {
+            &self.socket
+        }
 
-    pub fn get_mut(&mut self) -> &mut UdpSocket {
-        &mut self.socket
-    }
+        pub fn get_mut(&mut self) -> &mut UdpSocket {
+            &mut self.socket
+        }
 
-    pub fn into_inner(self) -> (S, UdpSocket) {
-        (self.stream, self.socket)
-    }
+        pub fn into_inner(self) -> (S, UdpSocket) {
+            (self.stream, self.socket)
+        }
 
-    async fn write_request(buf: &[u8], addr: AddrKind) -> Result<Vec<u8>> {
-        let bytes_size = Self::get_buf_size(addr.size(), buf.len());
-        let bytes = Vec::with_capacity(bytes_size);
+        async fn write_request(buf: &[u8], addr: AddrKind) -> Result<Vec<u8>> {
+            let bytes_size = Self::get_buf_size(addr.size(), buf.len());
+            let bytes = Vec::with_capacity(bytes_size);
 
-        let mut cursor = Cursor::new(bytes);
-        cursor.write_reserved().await?;
-        cursor.write_reserved().await?;
-        cursor.write_fragment_id().await?;
-        cursor.write_target_addr(&addr).await?;
-        cursor.write_all(buf).await?;
+            let mut cursor = Cursor::new(bytes);
+            cursor.write_reserved().await?;
+            cursor.write_reserved().await?;
+            cursor.write_fragment_id().await?;
+            cursor.write_target_addr(&addr).await?;
+            cursor.write_all(buf).await?;
 
-        let bytes = cursor.into_inner();
-        Ok(bytes)
-    }
+            let bytes = cursor.into_inner();
+            Ok(bytes)
+        }
 
-    pub async fn send_to<A>(&self, buf: &[u8], addr: A) -> Result<usize>
-    where
-        A: Into<AddrKind>,
-    {
-        let addr: AddrKind = addr.into();
-        let bytes = Self::write_request(buf, addr).await?;
-        Ok(self.socket.send(&bytes).await?)
-    }
+        pub async fn send_to<A>(&self, buf: &[u8], addr: A) -> Result<usize>
+        where
+            A: Into<AddrKind>,
+        {
+            let addr: AddrKind = addr.into();
+            let bytes = Self::write_request(buf, addr).await?;
+            Ok(self.socket.send(&bytes).await?)
+        }
 
-    async fn read_response(
-        len: usize,
-        buf: &mut [u8],
-        bytes: &mut [u8],
-    ) -> Result<(usize, AddrKind)> {
-        let mut cursor = Cursor::new(bytes);
-        cursor.read_reserved().await?;
-        cursor.read_reserved().await?;
-        cursor.read_fragment_id().await?;
-        let addr = cursor.read_target_addr().await?;
-        let header_len = cursor.position() as usize;
-        cursor.read_exact(buf).await?;
-        Ok((len - header_len, addr))
-    }
+        async fn read_response(
+            len: usize,
+            buf: &mut [u8],
+            bytes: &mut [u8],
+        ) -> Result<(usize, AddrKind)> {
+            let mut cursor = Cursor::new(bytes);
+            cursor.read_reserved().await?;
+            cursor.read_reserved().await?;
+            cursor.read_fragment_id().await?;
+            let addr = cursor.read_target_addr().await?;
+            let header_len = cursor.position() as usize;
+            cursor.read_exact(buf).await?;
+            Ok((len - header_len, addr))
+        }
 
-    pub async fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, AddrKind)> {
-        let bytes_size = Self::get_buf_size(AddrKind::MAX_SIZE, buf.len());
-        let mut bytes = vec![0; bytes_size];
+        pub async fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, AddrKind)> {
+            let bytes_size = Self::get_buf_size(AddrKind::MAX_SIZE, buf.len());
+            let mut bytes = vec![0; bytes_size];
 
-        let len = self.socket.recv(&mut bytes).await?;
-        let (read, addr) = Self::read_response(len, buf, &mut bytes).await?;
-        Ok((read, addr))
-    }
+            let len = self.socket.recv(&mut bytes).await?;
+            let (read, addr) = Self::read_response(len, buf, &mut bytes).await?;
+            Ok((read, addr))
+        }
 
-    fn get_buf_size(addr_size: usize, buf_len: usize) -> usize {
-        2 // reserved
+        fn get_buf_size(addr_size: usize, buf_len: usize) -> usize {
+            2 // reserved
                 + 1 // fragment id
                 + addr_size
                 + buf_len
+        }
     }
 }
+
+#[cfg(feature = "tokio-net")]
+pub use datagram::*;
 
 // Tests
 // *****************************************************************************
 
+#[cfg(feature = "tokio-net")]
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use tokio::{io::BufStream, net::TcpStream};
+    use tokio::{
+        io::BufStream,
+        net::{TcpStream, UdpSocket},
+    };
 
     const PROXY_ADDR: &str = "127.0.0.1:1080";
     const PROXY_AUTH_ADDR: &str = "127.0.0.1:1081";
